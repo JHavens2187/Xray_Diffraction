@@ -1,0 +1,227 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+import os
+import subprocess
+import pymatgen
+from pymatgen.ext.matproj import MPRester
+from pymatgen.analysis.diffraction.xrd import XRDCalculator
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+from scipy.stats import pearsonr
+
+# === Constants ===
+d_spacing = 0.25 # Approximate d-spacing (adjust if needed)
+n = 1 # Diffraction order
+WAVELENGTH_K_ALPHA = 1.54  # Å (Cu K-alpha)
+U_VALUES = [30, 28, 26, 24, 22, 20, 18, 16]  # Extend as necessary
+DATA_DIR = "Xray_Diffraction/Xray"
+I = 0.5  # mA
+delta_t = 0.1  # s
+delta_beta = 0.1  # degrees
+
+# Update rcParams for lighter background, better font, and grid lines
+plt.rcParams.update({
+    #"text.usetex": True,
+    "axes.facecolor": 'white',  # Lighter background for the axes
+    "figure.facecolor": 'white',  # Lighter background for the figure
+    "axes.edgecolor": 'black',
+    "xtick.color": 'black',
+    "ytick.color": 'black',
+    "grid.color": 'lightgrey',
+    "axes.titlesize": 16,  # Increase title font size
+    "axes.labelsize": 14,   # Increase label font size
+    "xtick.labelsize": 12,  # Increase x-axis tick font size
+    "ytick.labelsize": 12,  # Increase y-axis tick font size
+})
+
+# === Functions ===
+
+def load_data(file_path):
+    """Load .csv file and return as a pandas DataFrame."""
+    return pd.read_csv(file_path)
+
+def process_data(data, background):
+    """
+    Process data by:
+    - Subtracting the Cu anode background
+    """
+    subtracted = data - background
+    normalization_factor = subtracted.max()
+    return subtracted / normalization_factor
+
+def convert_to_two_theta(beta_angles):
+    """Convert beta (angle) to 2-theta."""
+    return 2 * beta_angles
+
+def detect_peaks(data, prominence=0.1, distance=10):  # Optimized parameters
+    """
+    Detects peaks in the data using prominence and distance.
+    """
+    peaks, _ = find_peaks(data, prominence=prominence, distance=distance)
+    return peaks
+
+def match_peaks(experimental_peaks, reference_peaks):
+    """
+    Matches experimental peaks to reference peaks using scaling and shifting.
+    """
+    # Calculate scale and shift based on prominent peaks
+    prominent_exp_peaks = experimental_peaks[np.argsort(experimental_peaks)[-3:]]  # Top 3 peaks
+    prominent_ref_peaks = reference_peaks[np.argsort(reference_peaks)[-3:]]  # Top 3 peaks
+
+    scale_factor = np.mean(prominent_ref_peaks) / np.mean(prominent_exp_peaks)
+    shift_value = np.mean(prominent_ref_peaks - prominent_exp_peaks * scale_factor)
+
+    return experimental_peaks * scale_factor + shift_value, scale_factor, shift_value
+
+def identify_crystal(adjusted_peaks, reference_peaks_list):
+    """Compare adjusted peaks with a list of reference peaks and find the best match."""
+    best_match = None
+    best_score = float('inf')
+
+    for reference_peaks in reference_peaks_list:
+        reference_peaks_interp = interp1d(
+            np.arange(len(reference_peaks)), reference_peaks, kind='linear', fill_value="extrapolate"
+            )(np.linspace(0, len(reference_peaks) - 1, len(adjusted_peaks))
+            )
+        score, _ = pearsonr(adjusted_unknown_peaks, reference_peaks_interp)
+        if score < best_score:
+            best_score = score
+            best_match = reference_peaks
+
+    return best_match, best_score
+
+def plot_raw_data(beta_angles, crystal, cu_anode, U):
+    """Plot raw X-ray data for the unknown material."""
+    plt.figure(figsize=(8, 6))
+    plt.plot(beta_angles, crystal, label="Crystal Data", color='blue', linewidth=2)
+    plt.plot(beta_angles, cu_anode, label="Cu Anode Data", color='red', linewidth=2)
+    plt.xlabel(r'$\beta$ (degrees)', fontsize=14)  # LaTeX for beta symbol
+    plt.ylabel(r'Counts [$s^{-1}$]', fontsize=14)  # LaTeX for units
+    plt.title(f'Raw X-ray Data for U={U} kV', fontsize=16)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(f"raw_data_{U}kV.png")
+    plt.show()
+
+def plot_processed_data(two_theta, processed_crystal, U):
+    """Plot processed X-ray data for the unknown material."""
+    plt.figure(figsize=(8, 6))
+    plt.plot(two_theta, processed_crystal, label="Processed Crystal Data", color='green', linewidth=2)
+    plt.xlabel(r'$2\theta$ (degrees)', fontsize=14)
+    plt.ylabel(r'Normalized Counts [$s^{-1}$]', fontsize=14)
+    plt.title(f'Processed X-ray Data for U={U} kV', fontsize=16)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(f"processed_data_{U}kV.png")
+    plt.show()
+
+# === Main Script ===
+
+# Initialize MPRester with API Key
+mpr = MPRester(API_KEY)
+
+# Query materials from Materials Project API
+materials = ["Al", "Cu"]  # You can add more elements to check
+reference_peaks_list = []
+
+# Initialize the XRDCalculator with Cu K-alpha radiation (1.5406 Å)
+xrd_calc = XRDCalculator(wavelength=float(1.5406))
+
+for mat in materials:
+    structures = mpr.get_structures(mat)  # Fetch crystal structure(s) for the material
+    for structure in structures:  # Process all available structures
+        xrd_pattern = xrd_calc.get_pattern(structure)
+        reference_peaks_list.append(xrd_pattern.x)  # Store 2θ values
+
+if not reference_peaks_list:
+    raise ValueError("No reference peaks found. Check API key and internet connection.")
+
+# Process X-ray data for unknown materials
+for U in U_VALUES:
+    file_path = os.path.join(DATA_DIR, f"xray_data_{U}v.csv")
+
+    if not os.path.exists(file_path):
+        print(f"Warning: File {file_path} not found. Skipping U={U} kV.")
+        continue
+
+    data = load_data(file_path)
+
+    beta_angles = data.iloc[:, 0]
+    deg20_idx = np.where(beta_angles == 20)[0]
+
+    if len(deg20_idx) == 0:
+        print(f"Warning: No beta=2theta° found in data for U={U} kV. Skipping.")
+        continue
+
+    deg20 = deg20_idx[0]
+    beta_angles = beta_angles[:deg20]
+    crystal = data["crystal"][:deg20]
+    cu_anode = data["cu"][:deg20]
+    copper_counts = data["cu crystal"][:deg20]
+
+    # Convert angles to wavelengths using Bragg's Law: λ = (2 * d * sin(θ)) / n
+    theta_rad = np.radians(beta_angles / 2) # Convert angles to radians
+    wavelengths =(2 * d_spacing * np.sin(theta_rad)) / n # Wavelength in nm
+
+    # Find peaks in both spectra
+    cu_peaks = detect_peaks(copper_counts, prominence=0.2, distance=5)  # Adjust prominence and distance
+    unknown_peaks = detect_peaks(crystal, prominence=0.2, distance=5)
+
+    if len(reference_peaks_list) == 0:
+        print("Error: No reference peaks available for comparison.")
+        continue
+
+    # Match experimental peaks to reference peaks
+    adjusted_cu_peaks, scale_factor, shift_value = match_peaks(cu_peaks, reference_peaks_list[0])  # Assume Cu reference is the first
+    adjusted_unknown_peaks = unknown_peaks * scale_factor + shift_value
+
+    # Identify the crystal based on the adjusted peaks
+    matched_crystal, score = identify_crystal(adjusted_unknown_peaks, reference_peaks_list)
+    print(f"Best match for U={U} kV: {matched_crystal[np.where(matched_crystal <= 20)]} (score={score})")
+
+    # Assuming 'matched_crystal' contains the reference peaks for the identified material
+    plt.figure(figsize=(10, 6))
+    plt.plot(adjusted_unknown_peaks, [1] * len(adjusted_unknown_peaks), 'o', label="Unknown Crystal Peaks")  # Plotting peaks as points
+    plt.plot(matched_crystal, [1] * len(matched_crystal), 'x', label="Reference Peaks")
+    plt.xlabel(r"2$\theta$ (degrees)")
+    plt.ylabel("Intensity (arbitrary)")
+    plt.title("Comparison of Unknown and Reference Peaks")
+    plt.legend()
+    plt.show()
+
+# Load CSV (adjust delimiter if necessary)
+for U in U_VALUES:
+    df = pd.read_csv(f'Xray_Diffraction/Xray/xray_data_{U}v.csv', delimiter=',')
+
+    # Extract angles (assuming first column is angles in degrees)
+    angles = df.iloc[:, 0] # First column: angles
+
+    # Extract intensity columns (assuming Cu and unknown metal)
+    copper_counts = df.iloc[:, 2] # Second column: copper
+    unknown_counts = df.iloc[:, 1] # Third column: unknown metal
+
+    # Convert angles to wavelengths using Bragg's Law: λ = (2 * d * sin(θ)) / n
+    theta_rad = np.radians(angles) # Convert angles to radians
+    wavelengths =(2 * d_spacing * np.sin(theta_rad)) / n # Wavelength in nm
+
+    # Find peaks in both spectra
+    cu_peaks, _ = find_peaks(copper_counts, height=np.max(copper_counts) * 0.1)
+    unknown_peaks, _ = find_peaks(unknown_counts, height=np.max(unknown_counts) * 0.1)
+
+    # Plot both spectra
+    plt.figure(figsize=(20, 10))
+    plt.plot(wavelengths, copper_counts, label="Copper", color="red")
+    plt.plot(wavelengths, unknown_counts, label="Unknown Metal", color="blue")
+    plt.scatter(wavelengths[cu_peaks], copper_counts[cu_peaks], color="purple", label="Cu Peaks")
+    plt.scatter(wavelengths[unknown_peaks], unknown_counts[unknown_peaks], color="green", label="Unknown Peaks")
+
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity (Counts)")
+    plt.title(f"X-ray Diffraction Spectrum at {U}kV   d={d_spacing}   ")
+    plt.legend()
+    plt.show()
