@@ -1,0 +1,141 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+from scipy.stats import pearsonr
+import os
+from pymatgen.ext.matproj import MPRester
+from pymatgen.analysis.diffraction.xrd import XRDCalculator
+
+# Constants
+API_KEY = XXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+WAVELENGTH_K_ALPHA = 1.5406  # Å (Cu K-alpha)
+U_VALUES = [30, 28, 26, 24, 22, 20, 18, 16]
+DATA_DIR = "Xray_Diffraction/Xray"
+D_SPACING = 0.25  # Approximate d-spacing (adjust if needed)
+N = 1  # Diffraction order
+
+# --- Improved Peak Detection and Matching ---
+def detect_peaks_improved(data, prominence=0.2, distance=5):
+    """Improved peak detection with prominence relative to local maxima."""
+    peaks, _ = find_peaks(data, prominence=prominence * np.max(data), distance=distance)
+    return peaks
+
+def match_peaks_improved(exp_peaks, ref_peaks, exp_two_theta, ref_two_theta):
+    """
+    More robust peak matching using interpolation and minimizing distance.
+    """
+    best_match = None
+    min_distance = float('inf')
+
+    for ref in ref_two_theta:
+        # Interpolate reference data to match experimental two-theta range
+        f = interp1d(ref, np.arange(len(ref)), kind='linear', fill_value="extrapolate")
+        ref_interp_indices = f(exp_two_theta)
+        ref_interp_peaks = ref[np.round(ref_interp_indices).astype(int)]
+
+        # Calculate the distance between peaks (you might want to experiment with different distance metrics)
+        distance = np.sum(np.abs(exp_peaks - ref_interp_peaks)) #Sum of absolute differences
+        #distance = np.sqrt(np.sum((exp_peaks - ref_interp_peaks)**2)) #Euclidean distance
+
+        if distance < min_distance:
+            min_distance = distance
+            best_match = ref
+
+    return best_match, min_distance
+
+def convert_to_two_theta(beta_angles):
+    """Convert beta (angle) to 2-theta."""
+    return 2 * beta_angles
+
+# --- Main Script ---
+
+mpr = MPRester(API_KEY)
+xrd_calc = XRDCalculator(wavelength=WAVELENGTH_K_ALPHA)
+
+reference_patterns = {}
+
+materials = ["Al", "Cu", "Ag", "Au", "Ni", "Fe"]  # Add more materials as needed
+
+for mat in materials:
+    try:
+        structures = mpr.get_structures(mat)
+        for structure in structures:
+            xrd_pattern = xrd_calc.get_pattern(structure)
+            if mat not in reference_patterns:
+                reference_patterns[mat] = []
+            reference_patterns[mat].append(xrd_pattern.x)
+    except Exception as e:
+        print(f"Error fetching structure for {mat}: {e}")
+
+if not reference_patterns:
+    raise ValueError("No reference patterns found. Check API key and internet connection.")
+
+
+for U in U_VALUES:
+    file_path = os.path.join(DATA_DIR, f"xray_data_{U}v.csv")
+    if not os.path.exists(file_path):
+        print(f"Warning: File {file_path} not found. Skipping U={U} kV.")
+        continue
+
+    df = pd.read_csv(file_path)
+    beta_angles = df.iloc[:, 0].values
+    crystal_counts = df.iloc[:, 1].values
+    cu_counts = df.iloc[:, 2].values
+    
+    min_len = min(len(beta_angles), len(crystal_counts), len(cu_counts))
+    beta_angles = beta_angles[:min_len]
+    crystal_counts = crystal_counts[:min_len]
+    cu_counts = cu_counts[:min_len]
+
+    two_theta = convert_to_two_theta(beta_angles)
+    
+    background = np.mean(cu_counts[:50])
+    crystal_counts_subtracted = crystal_counts - background
+    cu_counts_subtracted = cu_counts - background
+
+    crystal_counts_normalized = crystal_counts_subtracted / np.max(crystal_counts_subtracted)
+    cu_counts_normalized = cu_counts_subtracted / np.max(cu_counts_subtracted)
+
+    cu_peaks_indices = detect_peaks_improved(cu_counts_normalized, prominence=0.1, distance=5)
+    crystal_peaks_indices = detect_peaks_improved(crystal_counts_normalized, prominence=0.1, distance=5)
+
+    cu_peaks_two_theta = two_theta[cu_peaks_indices]
+    crystal_peaks_two_theta = two_theta[crystal_peaks_indices]
+
+    best_match_material = None
+    min_distance = float('inf')
+    best_matched_pattern = None #Initialize
+
+    for material, ref_two_theta_list in reference_patterns.items():
+        for ref_two_theta in ref_two_theta_list:
+            matched_ref_peaks, distance = match_peaks_improved(crystal_peaks_two_theta, ref_two_theta, two_theta, ref_two_theta)
+            if distance < min_distance:
+                min_distance = distance
+                best_match_material = material
+                best_matched_pattern = ref_two_theta
+
+    print(f"Best match for U={U} kV: {best_match_material} (distance={min_distance})")
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(two_theta, crystal_counts_normalized, label="Unknown Crystal", color="blue")
+    plt.plot(two_theta, cu_counts_normalized, label="Cu Reference", color="red")
+
+    if best_match_material:
+        plt.scatter(crystal_peaks_two_theta, [1] * len(crystal_peaks_two_theta), color="green", label="Unknown Peaks", marker='x', s=100)
+        
+        if best_matched_pattern is not None: #Check if a pattern was matched
+            f = interp1d(best_matched_pattern, np.arange(len(best_matched_pattern)), kind='linear', fill_value="extrapolate")
+            ref_interp_indices = f(two_theta)
+            ref_interp_peaks = best_matched_pattern[np.round(ref_interp_indices).astype(int)]
+
+            plt.scatter(ref_interp_peaks, [1] * len(ref_interp_peaks), color="purple", label=f"{best_match_material} Reference Peaks", marker='o', s=100)
+
+    plt.xlabel(r"2$\theta$ (degrees)")
+    plt.ylabel("Normalized Intensity")
+    plt.title(f"XRD Pattern Comparison at {U} kV")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"xrd_comparison_{U}kV.png")
+    plt.show()
